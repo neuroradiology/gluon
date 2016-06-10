@@ -175,8 +175,8 @@ impl Compiler {
         let function = self.compile_script(vm, filename, &expr);
         let function = vm.new_function(function);
         let closure = {
-            let stack = vm.current_frame();
-            vm.alloc(&stack.stack, ClosureDataDef(function, &[]))
+            let stack = vm.get_stack();
+            vm.alloc(&stack, ClosureDataDef(function, &[]))
         };
         let value = try!(vm.call_module(&typ, closure));
         try!(vm.set_global(function.name.clone(), typ, metadata, value));
@@ -207,8 +207,8 @@ impl Compiler {
         function.id = Symbol::new(name);
         let function = vm.new_function(function);
         let closure = {
-            let stack = vm.current_frame();
-            vm.alloc(&stack.stack, ClosureDataDef(function, &[]))
+            let stack = vm.get_stack();
+            vm.alloc(&stack, ClosureDataDef(function, &[]))
         };
         let value = try!(vm.call_module(&typ, closure));
         Ok((vm.root_value_ref(value), typ))

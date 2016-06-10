@@ -97,28 +97,29 @@ fn send(sender: &Sender<Generic<A>>, value: Generic<A>) -> Result<(), ()> {
 }
 
 fn resume(vm: &Thread) -> Status {
-    let mut stack = vm.current_frame();
-    match stack[0] {
+    let mut stack = vm.get_stack();
+    let value = StackFrame::current(&mut stack)[0];
+    match value {
         Value::Thread(thread) => {
             drop(stack);
             let child = RootedThread::from_gc_ptr(thread);
             let result = child.resume();
-            stack = vm.current_frame();
+            stack = vm.get_stack();
             match result {
                 Ok(()) |
                 Err(Error::Yield) => {
                     let value: Result<(), &str> = Ok(());
-                    value.push(vm, &mut stack.stack);
+                    value.push(vm, &mut stack);
                     Status::Ok
                 }
                 Err(Error::Dead) => {
                     let value: Result<(), &str> = Err("Attempted to resume a dead thread");
-                    value.push(vm, &mut stack.stack);
+                    value.push(vm, &mut stack);
                     Status::Ok
                 }
                 Err(err) => {
                     let fmt = format!("{}", err);
-                    let result = Value::String(vm.alloc(&stack.stack, &fmt[..]));
+                    let result = Value::String(vm.alloc(&stack, &fmt[..]));
                     stack.push(result);
                     Status::Error
                 }
@@ -143,7 +144,7 @@ fn spawn<'vm>(value: WithVM<'vm, Function<&'vm Thread, fn(())>>) -> RootedThread
         };
         value.value.push(value.vm, &mut stack);
         stack.push(Value::Int(0));
-        StackFrame::current(stack).enter_scope(1, callable);
+        StackFrame::current(&mut stack).enter_scope(1, callable);
     }
     thread
 }

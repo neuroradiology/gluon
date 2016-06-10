@@ -5,6 +5,7 @@ use vm::api::generic::A;
 use vm::api::{Getable, Pushable, Generic};
 use vm::types::VMIndex;
 use vm::vm::{RootedThread, Thread, Value, VMInt};
+use vm::stack::StackFrame;
 
 use super::Compiler;
 
@@ -107,7 +108,8 @@ pub unsafe extern "C" fn get_string(vm: &Thread,
                                     out: &mut &u8,
                                     out_len: &mut usize)
                                     -> Error {
-    let stack = vm.current_frame();
+    let mut stack = vm.get_stack();
+    let stack = StackFrame::current(&mut stack);
     match stack.get_variants(index).and_then(|value| <&str>::from_value(vm, value)) {
         Some(value) => {
             *out = &*value.as_ptr();
@@ -121,7 +123,8 @@ pub unsafe extern "C" fn get_string(vm: &Thread,
 unsafe fn get_value<T>(vm: &Thread, index: VMIndex, out: &mut T) -> Error
     where T: for<'vm> Getable<'vm>
 {
-    let stack = vm.current_frame();
+    let mut stack = vm.get_stack();
+    let stack = StackFrame::current(&mut stack);
     match stack.get_variants(index).and_then(|value| T::from_value(vm, value)) {
         Some(value) => {
             *out = value;

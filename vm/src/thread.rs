@@ -130,47 +130,6 @@ impl<'b> Traverseable for Roots<'b> {
     }
 }
 
-struct Context<'b> {
-    thread: &'b Thread,
-    stack: StackFrame<'b>,
-    gc: MutexGuard<'b, Gc>,
-}
-
-impl<'b> Context<'b> {
-    fn enter_scope(self, args: VMIndex, state: State) -> Context<'b> {
-        Context {
-            thread: self.thread,
-            gc: self.gc,
-            stack: self.stack.enter_scope(args, state),
-        }
-    }
-
-    fn exit_scope(self) -> Option<Context<'b>> {
-        let Context { thread, stack, gc } = self;
-        stack.exit_scope()
-             .map(move |stack| {
-                 Context {
-                     thread: thread,
-                     stack: stack,
-                     gc: gc,
-                 }
-             })
-    }
-}
-fn alloc<D>(gc: &mut Gc, thread: &Thread, stack: &Stack, def: D) -> GcPtr<D::Value>
-    where D: DataDef + Traverseable,
-          D::Value: Sized + Any
-{
-    let roots = Roots {
-        vm: unsafe {
-            // Threads must only be on the garbage collectors heap which makes this safe
-            GcPtr::from_raw(thread)
-        },
-        stack: stack,
-    };
-    unsafe { gc.alloc_and_collect(roots, def) }
-}
-
 // All threads MUST be allocated in the garbage collected heap. This is necessary as a thread
 // calling collect need to mark itself if it is on the garbage collected heap and it has no way of
 // knowing wheter it is or not. So the only way of allowing it to mark itself is to disallow it to
@@ -283,7 +242,10 @@ impl RootedThread {
         let vm = RootedThread::from_gc_ptr(gc.alloc(Move(thread)));
         *vm.gc.lock().unwrap() = gc;
         // Enter the top level scope
-        StackFrame::frame(vm.stack.lock().unwrap(), 0, State::Unknown);
+        {
+            let mut stack = vm.stack.lock().unwrap();
+            StackFrame::frame(&mut stack, 0, State::Unknown);
+        }
         vm
     }
 
@@ -334,7 +296,10 @@ impl Thread {
             child_threads: RwLock::new(Vec::new()),
         };
         // Enter the top level scope
-        StackFrame::frame(vm.stack.lock().unwrap(), 0, State::Unknown);
+        {
+            let mut stack = vm.stack.lock().unwrap();
+            StackFrame::frame(&mut stack, 0, State::Unknown);
+        }
         RootedThread::from_gc_ptr(self.alloc(&self.stack.lock().unwrap(), Move(vm)))
     }
 
@@ -381,9 +346,8 @@ impl Thread {
     }
 
     /// Returns the current stackframe
-    pub fn release_lock<'vm>(&'vm self, lock: ::stack::Lock) -> StackFrame<'vm> {
+    pub fn release_lock<'vm>(&'vm self, lock: ::stack::Lock) {
         self.stack.lock().unwrap().release_lock(lock);
-        StackFrame::current(self.get_stack())
     }
 
     /// Returns the current stackframe
@@ -391,15 +355,11 @@ impl Thread {
         self.stack.lock().unwrap()
     }
 
-    pub fn current_frame(&self) -> StackFrame {
-        StackFrame::current(self.get_stack())
-    }
-
-    fn current_context(&self) -> Context {
-        Context {
+    fn current_context(&self) -> OwnedContext {
+        OwnedContext {
             thread: self,
             gc: self.local_gc.lock().unwrap(),
-            stack: StackFrame::current(self.stack.lock().unwrap()),
+            stack: self.stack.lock().unwrap(),
         }
     }
 
@@ -530,18 +490,22 @@ impl Thread {
                 self.push(Int(0));// Dummy value to fill the place of the function for TailCall
                 self.push(value);
                 self.push(Int(0));
-                let mut context = Context {
+                let mut context = OwnedContext {
                     thread: self,
                     gc: self.local_gc.lock().unwrap(),
-                    stack: StackFrame::frame(self.stack.lock().unwrap(), 2, State::Unknown),
+                    stack: self.stack.lock().unwrap(),
                 };
+                context.borrow_mut().enter_scope(2, State::Unknown);
                 context = try!(self.call_context(context, 1))
                               .expect("call_module to have the stack remaining");
                 let result = context.stack.pop();
-                while context.stack.len() > 0 {
-                    context.stack.pop();
+                {
+                    let mut context = context.borrow_mut();
+                    while context.stack.len() > 0 {
+                        context.stack.pop();
+                    }
                 }
-                context.exit_scope();
+                let _ = context.exit_scope();
                 return Ok(result);
             }
         }
@@ -552,10 +516,10 @@ impl Thread {
     /// When this function is called it is expected that the function exists at
     /// `stack.len() - args - 1` and that the arguments are of the correct type
     pub fn call_function<'b>(&'b self,
-                             stack: StackFrame<'b>,
+                             stack: MutexGuard<'b, Stack>,
                              args: VMIndex)
-                             -> Result<Option<StackFrame<'b>>> {
-        let context = Context {
+                             -> Result<Option<MutexGuard<'b, Stack>>> {
+        let context = OwnedContext {
             thread: self,
             gc: self.local_gc.lock().unwrap(),
             stack: stack,
@@ -565,16 +529,16 @@ impl Thread {
     }
 
     fn call_context<'b>(&'b self,
-                        mut context: Context<'b>,
+                        mut context: OwnedContext<'b>,
                         args: VMIndex)
-                        -> Result<Option<Context<'b>>> {
-        context = try!(context.do_call(args));
+                        -> Result<Option<OwnedContext<'b>>> {
+        try!(context.borrow_mut().do_call(args));
         context.execute()
     }
 
     pub fn resume(&self) -> Result<()> {
         let context = self.current_context();
-        if context.stack.stack.get_frames().len() == 1 {
+        if context.stack.get_frames().len() == 1 {
             // Only the top level frame left means that the thread has finished
             return Err(Error::Dead);
         }
@@ -589,14 +553,178 @@ impl Thread {
 
     fn call_bytecode(&self, closure: GcPtr<ClosureData>) -> Result<Value> {
         self.push(Closure(closure));
-        let context = Context {
+        let mut context = OwnedContext {
             thread: self,
             gc: self.local_gc.lock().unwrap(),
-            stack: StackFrame::frame(self.stack.lock().unwrap(), 0, State::Closure(closure)),
+            stack: self.stack.lock().unwrap(),
         };
+        context.borrow_mut().enter_scope(0, State::Closure(closure));
         try!(context.execute());
         let mut stack = self.stack.lock().unwrap();
         Ok(stack.pop())
+    }
+}
+
+struct Context_<'b, S, G> {
+    thread: &'b Thread,
+    stack: S,
+    gc: G
+}
+
+type Context<'b> = Context_<'b, StackFrame<'b>, &'b mut Gc>;
+type OwnedContext<'b> = Context_<'b, MutexGuard<'b, Stack>, MutexGuard<'b, Gc>>;
+
+impl<'b> Context<'b> {
+    fn current(thread: &'b Thread, stack: &'b mut Stack, gc: &'b mut Gc) -> Context<'b> {
+        Context {
+            thread: thread,
+            gc: gc,
+            stack: StackFrame::current(stack),
+        }
+    }
+    fn enter_scope(self, args: VMIndex, state: State) -> Context<'b> {
+        Context {
+            thread: self.thread,
+            gc: self.gc,
+            stack: self.stack.enter_scope(args, state),
+        }
+    }
+
+    fn exit_scope(self) -> StdResult<Context<'b>, (&'b mut Stack, &'b mut Gc)> {
+        let Context { thread, stack, gc } = self;
+        match stack.exit_scope() {
+            Ok(stack) => {
+                 Ok(Context {
+                     thread: thread,
+                     stack: stack,
+                     gc: gc,
+                 })
+            }
+            Err(stack) => Err((stack, gc)),
+        }
+    }
+}
+fn alloc<D>(gc: &mut Gc, thread: &Thread, stack: &Stack, def: D) -> GcPtr<D::Value>
+    where D: DataDef + Traverseable,
+          D::Value: Sized + Any
+{
+    let roots = Roots {
+        vm: unsafe {
+            // Threads must only be on the garbage collectors heap which makes this safe
+            GcPtr::from_raw(thread)
+        },
+        stack: stack,
+    };
+    unsafe { gc.alloc_and_collect(roots, def) }
+}
+
+
+impl<'b> OwnedContext<'b> {
+    fn exit_scope(mut self) -> StdResult<OwnedContext<'b>, ()> {
+        let exists = self.borrow_mut().exit_scope().is_ok();
+        if exists { Ok(self) } else { Err(()) }
+    }
+
+    fn execute(self) -> Result<Option<OwnedContext<'b>>> {
+        let mut maybe_context = Some(self);
+        while let Some(mut context) = maybe_context {
+            debug!("STACK\n{:?}", context.stack.get_frames());
+            let state = context.borrow_mut().stack.frame.state;
+            maybe_context = match state {
+                State::Lock | State::Unknown => return Ok(Some(context)),
+                State::Excess => context.exit_scope().ok(),
+                State::Extern(ext) => {
+                    let instruction_index = context.borrow_mut().stack.frame.instruction_index;
+                    if instruction_index != 0 {
+                        // This function was already called
+                        return Ok(Some(context));
+                    } else {
+                        context.borrow_mut().stack.frame.instruction_index = 1;
+                        Some(try!(context.execute_function(&ext)))
+                    }
+                }
+                State::Closure(closure) => {
+                    // Tail calls into extern functions at the top level will drop the last
+                    // stackframe so just return immedietly
+                    enum State {
+                        Exists,
+                        DoesNotExist,
+                        ReturnContext,
+                    }
+                    let state = {
+                        let context = context.borrow_mut();
+
+                        if context.stack.stack.get_frames().len() == 0 {
+                            State::ReturnContext
+                        }
+                        else {
+                            let instruction_index = context.stack.frame.instruction_index;
+                            debug!("Continue with {}\nAt: {}/{}",
+                                   closure.function.name,
+                                   instruction_index,
+                                   closure.function.instructions.len());
+                            let new_context = try!(context.execute_(instruction_index,
+                                                                    &closure.function.instructions,
+                                                                    &closure.function));
+                            if new_context.is_some() {
+                                State::Exists
+                            }
+                            else {
+                                State::DoesNotExist
+                            }
+                        }
+                    };
+                    match state {
+                        State::Exists => Some(context),
+                        State::DoesNotExist => None,
+                        State::ReturnContext => return Ok(Some(context)),
+                    }
+                }
+            };
+        }
+        Ok(maybe_context)
+    }
+
+    fn execute_function(mut self, function: &ExternFunction) -> Result<OwnedContext<'b>> {
+        debug!("CALL EXTERN {}", function.id);
+        // Make sure that the stack is not borrowed during the external function call
+        // Necessary since we do not know what will happen during the function call
+        let thread = self.thread;
+        drop(self);
+        let status = (function.function)(thread);
+        self = thread.current_context();
+        {
+            let mut context = self.borrow_mut();
+            let result = context.stack.pop();
+            while context.stack.len() > 0 {
+                context.stack.pop();
+            }
+            context = try!(context.exit_scope()
+                        .map_err(|_| {
+                            Error::Message(StdString::from("Poped the last frame in \
+                                                            execute_function"))
+                        }));
+            context.stack.pop();// Pop function
+            context.stack.push(result);
+        }
+        match status {
+            Status::Ok => Ok(self),
+            Status::Yield => Err(Error::Yield),
+            Status::Error => {
+                match self.stack.pop() {
+                    String(s) => Err(Error::Message(s.to_string())),
+                    _ => Err(Error::Message("Unexpected panic in VM".to_string())),
+                }
+            }
+        }
+    }
+
+    fn borrow_mut(&mut self) -> Context {
+        Context {
+            thread: self.thread,
+            gc: &mut self.gc,
+            stack: StackFrame::current(&mut self.stack),
+        }
     }
 }
 
@@ -613,38 +741,6 @@ impl<'b> Context<'b> {
                 let function_index = self.stack.len() - ext.args - 1;
                 debug!("------- {} {:?}", function_index, &self.stack[..]);
                 Ok(self.enter_scope(ext.args, State::Extern(*ext)))
-            }
-        }
-    }
-
-    fn execute_function(mut self, function: &ExternFunction) -> Result<Context<'b>> {
-        debug!("CALL EXTERN {}", function.id);
-        // Make sure that the stack is not borrowed during the external function call
-        // Necessary since we do not know what will happen during the function call
-        let thread = self.thread;
-        drop(self);
-        let status = (function.function)(thread);
-        self = thread.current_context();
-        let result = self.stack.pop();
-        while self.stack.len() > 0 {
-            debug!("{} {:?}", self.stack.len(), &self.stack[..]);
-            self.stack.pop();
-        }
-        self = try!(self.exit_scope()
-                        .ok_or_else(|| {
-                            Error::Message(StdString::from("Poped the last frame in \
-                                                            execute_function"))
-                        }));
-        self.stack.pop();// Pop function
-        self.stack.push(result);
-        match status {
-            Status::Ok => Ok(self),
-            Status::Yield => Err(Error::Yield),
-            Status::Error => {
-                match self.stack.pop() {
-                    String(s) => Err(Error::Message(s.to_string())),
-                    _ => Err(Error::Message("Unexpected panic in VM".to_string())),
-                }
             }
         }
     }
@@ -723,43 +819,6 @@ impl<'b> Context<'b> {
         }
     }
 
-    fn execute(self) -> Result<Option<Context<'b>>> {
-        let mut maybe_context = Some(self);
-        while let Some(mut context) = maybe_context {
-            debug!("STACK\n{:?}", context.stack.stack.get_frames());
-            maybe_context = match context.stack.frame.state {
-                State::Lock | State::Unknown => return Ok(Some(context)),
-                State::Excess => context.exit_scope(),
-                State::Extern(ext) => {
-                    if context.stack.frame.instruction_index != 0 {
-                        // This function was already called
-                        return Ok(Some(context));
-                    } else {
-                        context.stack.frame.instruction_index = 1;
-                        Some(try!(context.execute_function(&ext)))
-                    }
-                }
-                State::Closure(closure) => {
-                    // Tail calls into extern functions at the top level will drop the last
-                    // stackframe so just return immedietly
-                    if context.stack.stack.get_frames().len() == 0 {
-                        return Ok(Some(context));
-                    }
-                    let instruction_index = context.stack.frame.instruction_index;
-                    debug!("Continue with {}\nAt: {}/{}",
-                           closure.function.name,
-                           instruction_index,
-                           closure.function.instructions.len());
-                    let new_context = try!(context.execute_(instruction_index,
-                                                            &closure.function.instructions,
-                                                            &closure.function));
-                    new_context
-                }
-            };
-        }
-        Ok(maybe_context)
-    }
-
     fn execute_(mut self,
                 mut index: usize,
                 instructions: &[Instruction],
@@ -810,12 +869,12 @@ impl<'b> Context<'b> {
                     }
                     let thread = self.thread;
                     self = match self.exit_scope() {
-                        Some(context) => context,
-                        None => {
+                        Ok(context) => context,
+                        Err((stack, gc)) => {
                             Context {
                                 thread: thread,
-                                gc: thread.local_gc.lock().unwrap(),
-                                stack: StackFrame::frame(thread.stack.lock().unwrap(),
+                                gc: gc,
+                                stack: StackFrame::frame(stack,
                                                          args + amount + 1,
                                                          State::Excess),
                             }
@@ -991,8 +1050,10 @@ impl<'b> Context<'b> {
         let frame_has_excess = self.stack.frame.excess;
         // We might not get access to the frame above the current as it could be locked
         let thread = self.thread;
-        let stack_exists = self.exit_scope().is_some();
-        let mut stack = thread.stack.lock().unwrap();
+        let ((stack, gc), stack_exists) = match self.exit_scope() {
+            Ok(stack) => ((stack.stack.take_stack(), stack.gc), true),
+            Err(err) => (err, false),
+        };
         stack.pop();
         for _ in 0..len {
             stack.pop();
@@ -1006,7 +1067,7 @@ impl<'b> Context<'b> {
                 Data(excess) => {
                     self = Context {
                         thread: thread,
-                        gc: thread.local_gc.lock().unwrap(),
+                        gc: gc,
                         stack: StackFrame::frame(stack, 0, State::Excess),
                     };
                     debug!("Push excess args {:?}", &excess.fields);
@@ -1019,9 +1080,8 @@ impl<'b> Context<'b> {
                 x => panic!("Expected excess arguments found {:?}", x),
             }
         } else {
-            drop(stack);
             Ok(if stack_exists {
-                Some(thread.current_context())
+                Some(Context::current(thread, stack, gc))
             } else {
                 None
             })

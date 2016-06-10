@@ -7,6 +7,7 @@ use gc::{Gc, Traverseable};
 use api::{Userdata, VMType, Pushable};
 use api::generic::A;
 use vm::{Status, Value, Thread, Result};
+use stack::StackFrame;
 
 
 pub struct Lazy<T> {
@@ -46,14 +47,15 @@ impl<T> VMType for Lazy<T>
 }
 
 fn force(vm: &Thread) -> Status {
-    let mut stack = vm.current_frame();
-    match stack[0] {
+    let mut stack = vm.get_stack();
+    let value = StackFrame::current(&mut stack)[0];
+    match value {
         Value::Userdata(lazy) => {
             let lazy = lazy.downcast_ref::<Lazy<A>>().expect("Lazy");
             let value = *lazy.value.lock().unwrap();
             match value {
                 Lazy_::Blackhole => {
-                    "<<loop>>".push(vm, &mut stack.stack);
+                    "<<loop>>".push(vm, &mut stack);
                     Status::Error
                 }
                 Lazy_::Thunk(value) => {
@@ -64,6 +66,7 @@ fn force(vm: &Thread) -> Status {
                     match result {
                         Ok(None) => panic!("Expected stack"),
                         Ok(Some(mut stack)) => {
+                            let mut stack = StackFrame::current(&mut stack);
                             let value = stack.pop();
                             while stack.len() > 1 {
                                 stack.pop();
@@ -81,7 +84,7 @@ fn force(vm: &Thread) -> Status {
                     }
                 }
                 Lazy_::Value(value) => {
-                    stack[0] = value;
+                    StackFrame::current(&mut stack)[0] = value;
                     Status::Ok
                 }
             }
@@ -91,13 +94,13 @@ fn force(vm: &Thread) -> Status {
 }
 
 fn lazy(vm: &Thread) -> Status {
-    let mut stack = vm.current_frame();
-    let f = stack[0];
+    let mut stack = vm.get_stack();
+    let f = StackFrame::current(&mut stack)[0];
     let lazy = Userdata(Lazy::<A> {
         value: Mutex::new(Lazy_::Thunk(f)),
         _marker: PhantomData,
     });
-    lazy.push(vm, &mut stack.stack)
+    lazy.push(vm, &mut stack)
 }
 
 pub fn load(vm: &Thread) -> Result<()> {
